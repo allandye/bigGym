@@ -26,11 +26,18 @@ Step 3 matters: the Home Screen app keeps its own storage, separate from Safari'
 
 ## How your history is saved
 
-- Everything is stored **on your phone**, inside this app, using the browser's database (IndexedDB). Every tap is saved right away. Nothing is sent to a server.
-- A second copy of the data is kept in the app's local storage. If the database ever comes back empty, the app restores from that copy.
+- Everything is stored **on your phone**, inside this app. Nothing is sent to a server. Every tap is saved right away.
+- The app keeps **three copies** on the phone: the browser's database (IndexedDB), a copy in local storage written on every change, and a copy in Cache Storage written a moment later. Each copy carries a revision number, and on launch the app loads whichever copy is newest and repairs the others.
+- Why: iOS has a known bug where a Home Screen app that sits in the background can lose its connection to the database. After that, writes fail silently while the screen still shows your data, and on the next launch the database has only what was saved before. The app now reconnects and retries a failed write, and if the database still refuses, the other two copies keep the change and it is restored on the next launch. A red banner says so if this happens.
 - The app asks iOS to keep its storage permanently. Apple says Home Screen web apps are exempt from Safari's rule that clears website data after 7 days without use.
 - **Risks you should know about:** deleting the Home Screen icon deletes its data. So can Settings › Safari › Clear History and Website Data, and moving to a new phone without a backup.
-- **Backup:** Home › *Backup & settings* › **Export backup file** saves a `.json` file through the share sheet. Save it to iCloud Drive or Files. **Import backup file** merges a backup back in and never deletes anything. Home shows a reminder if you haven't exported in two weeks.
+- **Backup:** after you finish a workout, the summary offers **Save a backup file**. Home › *Backup & settings* › **Export backup file** does the same. It saves a `.json` file through the share sheet; save it to iCloud Drive or Files. **Import backup file** merges a backup back in and never deletes anything. Home shows a reminder if you haven't exported in a week.
+
+## Pocket guard
+
+During a workout, a clear cover can sit over the screen so a phone set on a bench or pushed into a pocket doesn't press buttons. It comes down when you open a set, and after 10 seconds without a touch on the set or rest screen. You can still see the timer through it. **Swipe up** a good distance to lift it. To bring it back yourself, pull down (or tap) the lock tab at the top right. Turn it off in *Backup & settings*.
+
+Long numbers (1250 lb, 4 or 5 digits) shrink to fit their field.
 
 ## Suggested vs. confirmed numbers
 

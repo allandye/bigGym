@@ -1,6 +1,7 @@
 // Offline support: serve the app from cache, refresh the cache in the background.
 // Bump VERSION when files change so phones pick up the new version on the next launch.
-const VERSION = 'v1';
+const VERSION = 'v2';
+const DATA_CACHE = 'workout-data'; // the app's backup copy of your data; never deleted here
 const FILES = ['./', 'index.html', 'styles.css', 'logic.js', 'store.js', 'app.js',
   'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
@@ -9,7 +10,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== VERSION).map(k => caches.delete(k))))
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== VERSION && k !== DATA_CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
 

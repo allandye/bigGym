@@ -128,7 +128,7 @@
   // 1. Home
   screens.home = function () {
     const a = activeSession();
-    let html = '<h1>Your workouts</h1>';
+    let html = '<div class="ver">v' + APP_VERSION + '</div><h1>Your workouts</h1>';
     if (a && a.sets.length) {
       html += '<button class="resume" data-act="resume"><span class="resume-k">Resume workout</span>' +
         '<span class="resume-v">' + esc(a.typeName) + ' · ' + a.sets.length + ' set' + (a.sets.length === 1 ? '' : 's') + '</span></button>';

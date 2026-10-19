@@ -40,12 +40,13 @@
     return sessions().filter(s => !s.finishedAt).sort((a, b) => b.startedAt - a.startedAt)[0] || null;
   }
   function getRest() { return S.getMeta('rest', null); }
-  function settings() { return Object.assign({ sound: true, lastExportAt: 0 }, S.getMeta('settings', {})); }
+  function settings() { return Object.assign({ sound: true, guard: true, lastExportAt: 0 }, S.getMeta('settings', {})); }
 
   // ---------- navigation ----------
 
   function go(screen, params) {
     leaveCurrent(screen, params || {});
+    if (screen === 'set' && ui.screen !== 'set') guardPending = true;
     ui = { screen, params: params || {} };
     S.setMeta('ui', ui);
     render();
@@ -76,14 +77,26 @@
     const fn = screens[ui.screen] || screens.home;
     let html;
     try { html = fn(ui.params); } catch (e) { console.error(e); ui = { screen: 'home', params: {} }; html = screens.home({}); }
-    const warn = S.volatile ? '<div class="warn">This browser is not letting the app save data. Workouts will be lost when it closes.</div>' : '';
+    const warn = S.volatile ? '<div class="warn">This browser is not letting the app save data. Workouts will be lost when it closes.</div>' :
+      S.trouble ? TROUBLE : '';
     const msg = flash ? '<div class="flash" role="status">' + esc(flash) + '</div>' : '';
     flash = '';
     app.innerHTML = warn + msg + html;
     app.dataset.screen = ui.screen;
+    fitNums();
     tick();
     manageWakeLock();
+    guardAfterRender();
     if (ui.screen === 'data') showPersist();
+  }
+
+  const TROUBLE = '<div class="warn" data-trouble>The phone’s database didn’t accept the last change. A backup copy on the phone has it. Close the app fully and reopen it.</div>';
+
+  // Show or clear the save warning without redrawing the screen (which would wipe typing).
+  function showTrouble(on) {
+    const el = app.querySelector('[data-trouble]');
+    if (on && !el) app.insertAdjacentHTML('afterbegin', TROUBLE);
+    if (!on && el) el.remove();
   }
 
   function back(label, screen, params) {
@@ -136,7 +149,7 @@
         '<span class="chev">›</span></button>';
     }).join('') + '</div>';
     const st = settings();
-    const needBackup = done.length && Date.now() - (st.lastExportAt || 0) > 14 * 864e5;
+    const needBackup = done.length && Date.now() - (st.lastExportAt || 0) > 7 * 864e5;
     html += '<button class="linkbtn foot" data-go="data">' + (needBackup ? 'Back up your workout history' : 'Backup & settings') + '</button>';
     return html;
   };
@@ -374,6 +387,10 @@
     }
     if (anyUnconf) html += '<p class="hint"><b>?</b> Unconfirmed: suggested numbers that were never confirmed. Not counted in progress.</p>';
     html += '<button class="primary" data-go="home">Done</button>';
+    if (p.justFinished && (settings().lastExportAt || 0) < sess.finishedAt) {
+      html += '<button class="outline" data-act="export">Save a backup file</button>' +
+        '<p class="hint center">Keeps a copy off this phone, in iCloud Drive or Files.</p>';
+    }
     if (!p.justFinished) html += '<button class="linkbtn danger" data-act="deleteSession">Delete this workout</button>';
     return html;
   };
@@ -406,7 +423,10 @@
       '<p class="hint">Importing merges a backup into what’s here; it never deletes workouts.</p>' +
       '<div class="label">Rest timer</div>' +
       '<button class="outline" data-act="toggleSound">Sound at zero: ' + (st.sound ? 'On' : 'Off') + '</button>' +
-      '<p class="hint">One soft chime when rest reaches zero, while the app is open. The iPhone silent switch can mute it.</p>';
+      '<p class="hint">One soft chime when rest reaches zero, while the app is open. The iPhone silent switch can mute it.</p>' +
+      '<div class="label">Pocket guard</div>' +
+      '<button class="outline" data-act="toggleGuard">Pocket guard: ' + (st.guard ? 'On' : 'Off') + '</button>' +
+      '<p class="hint">During a workout, a clear cover stops stray taps. It comes down when a set starts and after 10 seconds without a touch. Swipe up to lift it. Pull down the lock tab at the top right to bring it back.</p>';
   };
 
   // ---------- actions ----------
@@ -620,6 +640,12 @@
       flash = 'Backup exported.';
       render();
     },
+    async toggleGuard() {
+      const st = settings();
+      st.guard = !st.guard;
+      await S.setMeta('settings', st);
+      render();
+    },
     async toggleSound() {
       const st = settings();
       st.sound = !st.sound;
@@ -727,9 +753,10 @@
     }
     if (t.dataset.field) {
       const v = L.parseNum(t.value, t.dataset.field === 'weight');
-      if (v === undefined) return;
+      if (v === undefined) return fitNum(t);
       if (v === null && (t.dataset.field !== 'weight' || ui.screen === 'rest')) return;
       applyValue(t.dataset.field, v);
+      fitNum(t);
       if (ui.screen === 'set') {
         const d = ui.params.draft;
         const btn = app.querySelector('[data-act="complete"]');
@@ -835,10 +862,125 @@
     if (document.visibilityState === 'visible') { tick(); manageWakeLock(); }
   });
 
+  // ---------- number fields: shrink long numbers to fit ----------
+
+  const measure = document.createElement('canvas').getContext('2d');
+  function fitNum(el) {
+    if (!el.dataset.base) el.dataset.base = parseFloat(getComputedStyle(el).fontSize);
+    const base = +el.dataset.base;
+    const cs = getComputedStyle(el);
+    measure.font = cs.fontWeight + ' ' + base + 'px ' + cs.fontFamily;
+    const w = measure.measureText(el.value || el.placeholder || '').width * 1.06 + 6;
+    const avail = el.clientWidth;
+    el.style.fontSize = (avail && w > avail ? Math.max(22, Math.floor(base * avail / w)) : base) + 'px';
+  }
+  function fitNums() { app.querySelectorAll('input.num').forEach(fitNum); }
+  window.addEventListener('resize', fitNums);
+
+  // ---------- pocket guard ----------
+  // A clear cover over the screen during a workout, so a phone set down or pocketed
+  // doesn't press buttons. Swipe up to lift it; pull down the tab at the top right to lower it.
+
+  const GUARD_IDLE_MS = 10000;
+  let guardOn = false;
+  let guardPending = false; // a set just started: lower the guard after this render
+  let idleTimer = null;
+  const LOCK_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.2" fill="currentColor"/>' +
+    '<path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" fill="none" stroke="currentColor" stroke-width="2.4"/></svg>';
+  const guard = document.createElement('div');
+  guard.className = 'guard';
+  guard.hidden = true;
+  guard.setAttribute('role', 'dialog');
+  guard.setAttribute('aria-label', 'Screen locked. Swipe up to unlock.');
+  guard.innerHTML = '<div class="guard-top">' + LOCK_SVG + ' Locked</div>' +
+    '<div class="guard-hint"><span class="guard-arrow" aria-hidden="true">︿</span>Swipe up to unlock</div>';
+  const tab = document.createElement('button');
+  tab.className = 'guard-tab';
+  tab.hidden = true;
+  tab.setAttribute('aria-label', 'Lock screen');
+  tab.innerHTML = LOCK_SVG + '<span class="guard-grip" aria-hidden="true"></span>';
+  document.body.append(guard, tab);
+
+  function guardEnabled() { return settings().guard !== false; }
+  function guardScreen() { return ['set', 'rest'].includes(ui.screen) || (ui.screen === 'type' && !!activeSession()); }
+
+  function setGuard(on) {
+    guardOn = on;
+    guard.hidden = !on;
+    guard.style.transform = '';
+    guard.classList.remove('lifting');
+    tab.hidden = on || !(guardEnabled() && guardScreen());
+    if (on && document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    resetIdle();
+  }
+
+  function resetIdle() {
+    clearTimeout(idleTimer);
+    if (guardOn || !guardEnabled() || !['set', 'rest'].includes(ui.screen)) return;
+    idleTimer = setTimeout(() => { if (['set', 'rest'].includes(ui.screen)) setGuard(true); }, GUARD_IDLE_MS);
+  }
+
+  function guardAfterRender() {
+    const lower = guardPending && ui.screen === 'set' && guardEnabled();
+    guardPending = false;
+    if (!guardEnabled() || !guardScreen()) setGuard(false);
+    else setGuard(lower || guardOn);
+  }
+
+  // Any touch on the app counts as activity.
+  ['pointerdown', 'keydown', 'input'].forEach(t => app.addEventListener(t, resetIdle, true));
+
+  // Swipe up on the cover to lift it. It follows the finger and needs a deliberate distance.
+  let gy = null;
+  guard.addEventListener('pointerdown', e => {
+    gy = e.clientY;
+    guard.setPointerCapture(e.pointerId);
+    guard.classList.add('lifting');
+  });
+  guard.addEventListener('pointermove', e => {
+    if (gy == null) return;
+    const dy = Math.min(0, e.clientY - gy);
+    guard.style.transform = 'translateY(' + dy + 'px)';
+  });
+  function guardRelease(e) {
+    if (gy == null) return;
+    const dy = gy - e.clientY;
+    gy = null;
+    guard.classList.remove('lifting');
+    if (e.type === 'pointerup' && dy > Math.max(110, window.innerHeight * 0.2)) {
+      guard.style.transform = 'translateY(-100%)';
+      setTimeout(() => setGuard(false), 180);
+    } else {
+      guard.style.transform = '';
+    }
+  }
+  guard.addEventListener('pointerup', guardRelease);
+  guard.addEventListener('pointercancel', guardRelease);
+  guard.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Pull the tab down (or tap it) to lower the cover.
+  let ty = null;
+  tab.addEventListener('pointerdown', e => { ty = e.clientY; tab.setPointerCapture(e.pointerId); });
+  tab.addEventListener('pointermove', e => {
+    if (ty == null) return;
+    const dy = Math.max(0, Math.min(60, e.clientY - ty));
+    tab.style.transform = 'translateY(' + dy + 'px)';
+    if (dy >= 40) { ty = null; tab.style.transform = ''; setGuard(true); }
+  });
+  tab.addEventListener('pointerup', () => {
+    if (ty == null) return;
+    ty = null;
+    tab.style.transform = '';
+    setGuard(true);
+  });
+  tab.addEventListener('pointercancel', () => { ty = null; tab.style.transform = ''; });
+
   // ---------- start ----------
 
   async function boot() {
+    S.onTrouble = showTrouble;
     await S.load();
+    S.requestPersistence();
     const saved = S.getMeta('ui', null);
     if (saved && saved.screen) ui = saved;
     // Drop a started workout with no sets unless we are still inside it.
@@ -861,7 +1003,7 @@
       (standalone ? ' Running as a Home Screen app.' : ' Tip: add this app to your Home Screen so iOS keeps its data.');
   }
   // Test hook (used by automated tests only).
-  window.__app = { get ui() { return ui; }, Store: S };
+  window.__app = { get ui() { return ui; }, get guardOn() { return guardOn; }, Store: S };
 
   boot();
 })();

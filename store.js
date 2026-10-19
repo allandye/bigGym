@@ -1,5 +1,9 @@
 // Storage: IndexedDB is the primary store, with every change written immediately.
-// A JSON snapshot is also mirrored to localStorage as a second copy on the device.
+// Two more copies live on the device: a snapshot in localStorage (written on every change)
+// and one in Cache Storage (written a moment later). Every copy carries a revision number,
+// so on launch the app loads whichever copy is newest. This covers the iOS bug where a
+// Home Screen app loses its IndexedDB connection after being in the background and later
+// writes silently fail.
 (function (root) {
   'use strict';
 
@@ -7,6 +11,10 @@
   const DB_VERSION = 1;
   const STORES = ['exercises', 'types', 'sessions', 'meta'];
   const MIRROR_KEY = 'workout-log-mirror';
+  const CACHE_NAME = 'workout-data';
+  const CACHE_URL = 'data-backup.json';
+  const REV_KEY = '_rev';
+  const TX_TIMEOUT = 4000;
 
   const state = {
     exercises: new Map(),
@@ -15,9 +23,13 @@
     meta: new Map(),
   };
   let db = null;
-  let volatile = false; // true when nothing can be saved (shown as a warning)
+  let volatile = false; // true when the database can't be opened at all
+  let trouble = false;  // true after a write failed even after reconnecting
+  let rev = 0;          // revision of the in-memory data; bumped on every change
   let lastWrite = Promise.resolve();
-  let mirrorTimer = null;
+  let mirrorQueued = false;
+  let cacheTimer = null;
+  let onTrouble = null;
 
   function req(r) {
     return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -33,40 +45,87 @@
           if (!d.objectStoreNames.contains(name)) d.createObjectStore(name, { keyPath: 'id' });
         }
       };
-      r.onsuccess = () => resolve(r.result);
+      r.onsuccess = () => {
+        const d = r.result;
+        d.onclose = () => { if (db === d) db = null; }; // connection lost; the next write reopens
+        d.onversionchange = () => { d.close(); if (db === d) db = null; };
+        resolve(d);
+      };
       r.onerror = () => reject(r.error);
       r.onblocked = () => reject(new Error('IndexedDB blocked'));
     });
   }
 
+  async function readDb() {
+    const out = {};
+    const tx = db.transaction(STORES, 'readonly');
+    for (const name of STORES) out[name] = await req(tx.objectStore(name).getAll());
+    const r = out.meta.find(m => m.id === REV_KEY);
+    out.meta = out.meta.filter(m => m.id !== REV_KEY);
+    out.rev = r ? r.value : 0;
+    return out;
+  }
+
+  function hasData(d) {
+    return !!d && ['sessions', 'types', 'exercises'].some(n => (d[n] || []).length);
+  }
+
   async function load() {
+    const mirror = readMirror();
+    const cached = await readCache();
+    let fromDb = null;
     try {
       db = await openDb();
-      const tx = db.transaction(STORES, 'readonly');
-      for (const name of STORES) {
-        const all = await req(tx.objectStore(name).getAll());
-        state[name] = new Map(all.map(x => [x.id, x]));
-      }
-      // If the database came back empty but the mirror has data, restore from the mirror.
-      if (!state.sessions.size && !state.types.size && !state.exercises.size) {
-        const m = readMirror();
-        if (m && ((m.sessions || []).length || (m.types || []).length)) {
-          await importData(m, { replace: true });
-        }
-      }
+      fromDb = await readDb();
     } catch (e) {
       console.warn('Storage unavailable', e);
       volatile = true;
-      const m = readMirror();
-      if (m) loadPlain(m);
     }
+
+    // Pick the newest copy. Ties go to the database.
+    let best = fromDb;
+    for (const c of [mirror, cached]) {
+      if (c && hasData(c) && (!best || (c.rev || 0) > (best.rev || 0) || (!hasData(best) && !best.rev))) best = c;
+    }
+    if (best) loadPlain(best);
+    rev = Math.max(rev, best ? best.rev || 0 : 0);
+
+    // Data saved before revision numbers existed: merge record by record, newest copy wins.
+    let merged = false;
+    for (const c of [fromDb, mirror, cached]) {
+      if (c && c !== best && hasData(c) && !c.rev && !(best && best.rev)) { mergeInto(c); merged = true; }
+    }
+
+    // If the database wasn't the newest copy, bring it (and the other copies) up to date.
+    const fresh = best !== fromDb || merged;
+    if (fresh) rev = Math.max(Date.now(), rev + 1);
+    if (db && fresh) await replaceDb();
+    if (fresh || best !== mirror) writeMirror();
+    if (fresh || best !== cached) scheduleCache(0);
     return state;
   }
 
   function loadPlain(data) {
     for (const name of STORES) {
-      state[name] = new Map((data[name] || []).map(x => [x.id, x]));
+      state[name] = new Map((data[name] || []).filter(x => x && x.id !== REV_KEY).map(x => [x.id, x]));
     }
+  }
+
+  function mergeInto(data) {
+    for (const name of ['exercises', 'types', 'sessions']) {
+      for (const recd of data[name] || []) {
+        const cur = state[name].get(recd.id);
+        if (!cur || (recd.updatedAt || 0) > (cur.updatedAt || 0)) state[name].set(recd.id, recd);
+      }
+    }
+  }
+
+  // ---------- the two backup copies on the device ----------
+
+  function snapshot() {
+    const out = { app: 'workout-log', version: 1, rev, savedAt: Date.now() };
+    for (const name of STORES) out[name] = all(name);
+    return out;
   }
 
   function readMirror() {
@@ -76,27 +135,122 @@
     } catch (e) { return null; }
   }
 
-  function scheduleMirror() {
-    clearTimeout(mirrorTimer);
-    mirrorTimer = setTimeout(() => {
-      try { localStorage.setItem(MIRROR_KEY, JSON.stringify(exportData())); } catch (e) { /* full or blocked */ }
-    }, 300);
+  function writeMirror() {
+    mirrorQueued = false;
+    try { localStorage.setItem(MIRROR_KEY, JSON.stringify(snapshot())); return true; }
+    catch (e) { console.warn('mirror write failed', e); return false; }
+  }
+
+  // Several changes in one tap are written to the mirror once, before the app can be suspended.
+  function queueMirror() {
+    if (mirrorQueued) return;
+    mirrorQueued = true;
+    Promise.resolve().then(writeMirror);
+  }
+
+  async function readCache() {
+    try {
+      if (!root.caches) return null;
+      const c = await caches.open(CACHE_NAME);
+      const r = await c.match(CACHE_URL);
+      return r ? await r.json() : null;
+    } catch (e) { return null; }
+  }
+
+  function scheduleCache(delay) {
+    clearTimeout(cacheTimer);
+    cacheTimer = setTimeout(writeCache, delay == null ? 1500 : delay);
+  }
+
+  async function writeCache() {
+    clearTimeout(cacheTimer);
+    cacheTimer = null;
+    try {
+      if (!root.caches) return;
+      const c = await caches.open(CACHE_NAME);
+      await c.put(CACHE_URL, new Response(JSON.stringify(snapshot()), { headers: { 'Content-Type': 'application/json' } }));
+    } catch (e) { console.warn('cache write failed', e); }
+  }
+
+  // Write everything out when the app goes to the background.
+  function flushCopies() {
+    if (mirrorQueued) writeMirror();
+    if (cacheTimer) writeCache();
+  }
+  if (root.addEventListener) {
+    root.addEventListener('pagehide', flushCopies);
+    root.document && document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushCopies(); });
+  }
+
+  // ---------- database writes ----------
+
+  // One transaction; resolves true on commit, false on error, abort or a hang.
+  function runTx(storeNames, fn) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = ok => { if (!done) { done = true; clearTimeout(t); resolve(ok); } };
+      const t = setTimeout(() => finish(false), TX_TIMEOUT);
+      try {
+        const tx = db.transaction(storeNames, 'readwrite');
+        fn(tx);
+        tx.oncomplete = () => finish(true);
+        tx.onerror = tx.onabort = () => { console.warn('write failed', tx.error); finish(false); };
+      } catch (e) {
+        console.warn('write failed', e);
+        finish(false);
+      }
+    });
+  }
+
+  // Run a write; if it fails, reconnect to the database and try once more.
+  async function txWithRetry(storeNames, fn) {
+    if (db && await runTx(storeNames, fn)) return true;
+    try { if (db) db.close(); } catch (e) { /* already closed */ }
+    db = null;
+    try { db = await openDb(); } catch (e) { console.warn('reopen failed', e); }
+    return !!db && runTx(storeNames, fn);
+  }
+
+  function setTrouble(v) {
+    if (trouble === v) return;
+    trouble = v;
+    try { if (onTrouble) onTrouble(v); } catch (e) { console.warn(e); }
   }
 
   function write(storeName, fn) {
-    scheduleMirror();
-    if (!db) return Promise.resolve(!volatile);
-    const p = lastWrite.then(() => new Promise((resolve) => {
-      try {
-        const tx = db.transaction(storeName, 'readwrite');
+    rev = Math.max(Date.now(), rev + 1);
+    const myRev = rev;
+    queueMirror();
+    scheduleCache();
+    if (volatile) return Promise.resolve(false);
+    const names = storeName === 'meta' ? ['meta'] : [storeName, 'meta'];
+    const p = lastWrite.catch(() => {}).then(async () => {
+      const ok = await txWithRetry(names, tx => {
         fn(tx.objectStore(storeName));
-        tx.oncomplete = () => resolve(true);
-        tx.onerror = tx.onabort = () => { console.warn('write failed', tx.error); resolve(false); };
-      } catch (e) {
-        console.warn('write failed', e);
-        resolve(false);
-      }
-    }));
+        tx.objectStore('meta').put({ id: REV_KEY, value: myRev });
+      });
+      setTrouble(!ok);
+      return ok;
+    });
+    lastWrite = p;
+    return p;
+  }
+
+  // Replace the database contents with the in-memory data (after loading a newer copy).
+  function replaceDb() {
+    const data = snapshot();
+    const p = lastWrite.catch(() => {}).then(async () => {
+      const ok = await txWithRetry(STORES, tx => {
+        for (const name of STORES) {
+          const s = tx.objectStore(name);
+          s.clear();
+          for (const x of data[name]) s.put(x);
+        }
+        tx.objectStore('meta').put({ id: REV_KEY, value: data.rev });
+      });
+      setTrouble(!ok);
+      return ok;
+    });
     lastWrite = p;
     return p;
   }
@@ -157,16 +311,14 @@
   }
 
   // Merge a backup into current data. For the same record id, the newer copy wins.
-  // With replace:true the backup is loaded as-is (used to restore from the local mirror).
-  async function importData(data, opts) {
+  async function importData(data) {
     validate(data);
-    const replace = opts && opts.replace;
     const counts = { added: 0, updated: 0 };
     for (const name of ['exercises', 'types', 'sessions']) {
       for (const rec of data[name]) {
         const cur = state[name].get(rec.id);
         if (!cur) counts.added++;
-        else if (replace || (rec.updatedAt || 0) > (cur.updatedAt || 0)) counts.updated++;
+        else if ((rec.updatedAt || 0) > (cur.updatedAt || 0)) counts.updated++;
         else continue;
         await putRaw(name, rec);
       }
@@ -192,7 +344,10 @@
   root.Store = {
     load, put, del, all, get, getMeta, setMeta, exportData, importData, validate,
     requestPersistence, isPersisted,
-    flush: () => lastWrite,
+    flush: () => { flushCopies(); return lastWrite; },
+    set onTrouble(fn) { onTrouble = fn; },
     get volatile() { return volatile; },
+    get trouble() { return trouble; },
+    get rev() { return rev; },
   };
 })(this);

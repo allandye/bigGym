@@ -11,17 +11,36 @@ const page = await ctx.newPage();
 await page.clock.install({ time: new Date('2026-10-09T17:00:00') });
 const errors = [];
 page.on('pageerror', e => errors.push(e.message));
+if (process.env.DEBUG) page.on('console', m => console.log('console:', m.text()));
 page.on('dialog', d => d.accept());
 
 let shot = 0;
 async function snap(name) {
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/${String(++shot).padStart(2, '0')}-${name}.png`, fullPage: true });
 }
-const btn = name => page.getByRole('button', { name, exact: false });
+const guardOn = () => page.evaluate(() => window.__app.guardOn);
+async function swipeUp(dist = 330) {
+  const vp = page.viewportSize();
+  const x = vp.width / 2, y = vp.height - 120;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  for (let i = 1; i <= 6; i++) await page.mouse.move(x, y - (dist * i) / 6);
+  await page.mouse.up();
+}
+async function unlock() {
+  if (!(await guardOn())) return;
+  await swipeUp();
+  await page.waitForFunction(() => !window.__app.guardOn);
+}
+// Buttons are pressed like a person would: lift the pocket guard first if it is down.
+const btn = name => {
+  const l = page.getByRole('button', { name, exact: false });
+  return { click: async () => { await unlock(); await l.click(); }, waitFor: o => l.waitFor(o), isDisabled: () => l.isDisabled(), count: () => l.count() };
+};
 const screen = () => page.evaluate(() => window.__app.ui.screen);
 const waitScreen = name => page.waitForFunction(n => window.__app && window.__app.ui.screen === n, name, { timeout: 5000 });
 const data = () => page.evaluate(() => window.__app.Store.exportData());
-const step = (field, dir) => page.locator(`[data-step="${field}"][data-dir="${dir}"]`).first().click();
+const step = async (field, dir) => { await unlock(); await page.locator(`[data-step="${field}"][data-dir="${dir}"]`).first().click(); };
 const val = field => page.locator(`input[data-field="${field}"]`).inputValue();
 async function ok(name, fn) { await fn(); console.log('ok -', name); }
 
@@ -85,6 +104,7 @@ await ok('new exercise: no invented values, user enters starting numbers', async
   assert.equal(await val('reps'), '');
   assert.ok(await btn('Set complete').isDisabled());
   for (let i = 0; i < 8; i++) await step('weight', 1);
+  await unlock();
   await page.fill('input[data-field=reps]', '12');
   await page.locator('input[data-field=reps]').blur();
   assert.equal(await val('weight'), '40');
@@ -229,6 +249,174 @@ await ok('backup export round-trips through import validation', async () => {
   assert.equal(r.added, 0);
   await btn('Back up').click();
   await snap('backup');
+});
+
+// Fits when the text, drawn in the input's own font, is no wider than the input.
+const fits = sel => page.evaluate(sel => {
+  const el = document.querySelector(sel);
+  const cs = getComputedStyle(el);
+  const sp = document.createElement('span');
+  sp.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font:' + cs.font + ';letter-spacing:' + cs.letterSpacing + ';font-variant-numeric:tabular-nums';
+  sp.textContent = el.value;
+  document.body.appendChild(sp);
+  const w = sp.getBoundingClientRect().width;
+  sp.remove();
+  return { w, avail: el.clientWidth, size: parseFloat(cs.fontSize) };
+}, sel);
+
+await ok('pocket guard comes down when a set starts; swipe up lifts it; tab lowers it', async () => {
+  await btn('Home').click();
+  await page.locator('.bigbtn', { hasText: 'Triceps & biceps' }).click();
+  await btn('Start workout').click();
+  await page.locator('.card', { hasText: 'Barbell curl' }).click();
+  await waitScreen('set');
+  assert.equal(await guardOn(), true);
+  assert.equal(await page.locator('.guard-tab').isVisible(), false);
+  await snap('guard-down');
+  // a tap on + does nothing while the guard is down
+  const plus = await page.locator('[data-step="weight"][data-dir="1"]').boundingBox();
+  await page.mouse.click(plus.x + plus.width / 2, plus.y + plus.height / 2);
+  assert.equal(await val('weight'), '');
+  // a short accidental drag does not lift it
+  await swipeUp(60);
+  await page.waitForTimeout(300);
+  assert.equal(await guardOn(), true);
+  await unlock();
+  assert.equal(await page.locator('.guard-tab').isVisible(), true);
+  await page.mouse.click(plus.x + plus.width / 2, plus.y + plus.height / 2);
+  assert.equal(await val('weight'), '5');
+  // 10 seconds without a touch brings it back
+  await page.clock.runFor(11000);
+  assert.equal(await guardOn(), true);
+  await unlock();
+  // pulling the tab down lowers it
+  const t = await page.locator('.guard-tab').boundingBox();
+  await page.mouse.move(t.x + t.width / 2, t.y + t.height / 2);
+  await page.mouse.down();
+  for (let i = 1; i <= 5; i++) await page.mouse.move(t.x + t.width / 2, t.y + t.height / 2 + i * 12);
+  await page.mouse.up();
+  assert.equal(await guardOn(), true);
+  await unlock();
+  await snap('guard-up-with-tab');
+});
+
+await ok('four- and five-digit numbers fit in the number fields', async () => {
+  await unlock();
+  await page.fill('input[data-field=weight]', '1250');
+  let f = await fits('input[data-field=weight]');
+  assert.ok(f.w <= f.avail, `weight 1250 is ${f.w}px in a ${f.avail}px field`);
+  assert.ok(f.size < 96 && f.size >= 40, 'shrinks a little, got ' + f.size);
+  await page.fill('input[data-field=reps]', '10000');
+  f = await fits('input[data-field=reps]');
+  assert.ok(f.w <= f.avail, `reps 10000 is ${f.w}px in a ${f.avail}px field`);
+  await page.locator('input[data-field=reps]').blur();
+  await page.fill('input[data-field=reps]', '12');
+  await page.locator('input[data-field=reps]').blur();
+  await snap('set-4-digits');
+  await btn('Set complete').click();
+  await waitScreen('rest');
+  f = await fits('input[data-field=weight]');
+  assert.ok(f.w <= f.avail, `rest weight 1250 is ${f.w}px in a ${f.avail}px field`);
+  assert.equal(await page.locator('input[data-field=weight]').inputValue(), '1250');
+  await snap('rest-4-digits');
+  await btn('Remove this set').click();
+  await waitScreen('set');
+  await unlock();
+});
+
+await ok('pocket guard can be turned off', async () => {
+  await btn('Workout').click();
+  await btn('Home').click();
+  await page.locator('.linkbtn.foot').click();
+  await btn('Pocket guard: On').click();
+  await btn('Pocket guard: Off').waitFor();
+  await btn('Home').click();
+  await page.locator('.bigbtn', { hasText: 'Triceps & biceps' }).click();
+  await btn('Start workout').click();
+  await page.locator('.card', { hasText: 'Barbell curl' }).click();
+  await waitScreen('set');
+  assert.equal(await guardOn(), false);
+  assert.equal(await page.locator('.guard-tab').isVisible(), false);
+  await btn('Workout').click();
+  await btn('Home').click();
+  await page.locator('.linkbtn.foot').click();
+  await btn('Pocket guard: Off').click();
+  await btn('Home').click();
+});
+
+const typeNames = () => page.locator('.bigbtn').allInnerTexts();
+async function newType(name) {
+  await btn('New workout type').click();
+  await page.fill('input[name=name]', name);
+  await btn('Create workout').click();
+  await waitScreen('type');
+  await btn('Home').click();
+}
+const idbTypes = () => page.evaluate(() => new Promise(res => {
+  const r = indexedDB.open('workout-log');
+  r.onsuccess = () => { const g = r.result.transaction('types').objectStore('types').getAll(); g.onsuccess = () => { res(g.result.map(t => t.name)); r.result.close(); }; };
+}));
+// Make the database refuse writes the way iOS does after its connection is lost.
+const breakDb = times => page.evaluate(times => {
+  let left = times;
+  const orig = IDBDatabase.prototype.transaction;
+  IDBDatabase.prototype.transaction = function (names, mode) {
+    if (mode === 'readwrite' && left-- > 0) throw new DOMException('Connection to Indexed Database server lost. Refresh the page to try again', 'UnknownError');
+    return orig.apply(this, arguments);
+  };
+}, times);
+
+await ok('a lost database connection is reconnected without losing the change', async () => {
+  await breakDb(1);
+  await newType('Back');
+  assert.equal(await page.locator('.warn').count(), 0);
+  assert.ok((await idbTypes()).includes('Back'));
+});
+
+await ok('changes made while the database refuses writes survive a restart', async () => {
+  await breakDb(1e9);
+  await newType('Legs');
+  await page.locator('.warn', { hasText: 'backup copy on the phone has it' }).waitFor();
+  assert.ok(!(await idbTypes()).includes('Legs'));
+  await page.reload();
+  await page.waitForSelector('.bigbtn');
+  assert.ok((await typeNames()).some(t => t.includes('Legs')));
+  assert.ok((await idbTypes()).includes('Legs'), 'database repaired from the newer copy');
+  assert.equal(await page.locator('.warn').count(), 0);
+});
+
+await ok('the Cache Storage copy restores data when the other two copies are stale', async () => {
+  await breakDb(1e9);
+  await page.evaluate(() => { Storage.prototype.setItem = function () { throw new DOMException('full', 'QuotaExceededError'); }; });
+  await newType('Shoulders');
+  await page.clock.runFor(2000);
+  await page.evaluate(() => window.__app.Store.flush());
+  await page.waitForTimeout(300);
+  await page.reload();
+  await page.waitForSelector('.bigbtn');
+  assert.ok((await typeNames()).some(t => t.includes('Shoulders')));
+  assert.ok((await idbTypes()).includes('Shoulders'));
+});
+
+await ok('data saved by the old version is merged from every copy on upgrade', async () => {
+  await page.evaluate(() => new Promise(res => {
+    // old format: no revision numbers anywhere; the mirror holds a type the database lost
+    const m = JSON.parse(localStorage.getItem('workout-log-mirror'));
+    delete m.rev;
+    m.types.push({ id: 'legacy-1', name: 'Chest', exerciseIds: [], createdAt: Date.now(), updatedAt: Date.now() });
+    localStorage.setItem('workout-log-mirror', JSON.stringify(m));
+    caches.delete('workout-data').then(() => {
+      const r = indexedDB.open('workout-log');
+      r.onsuccess = () => { const tx = r.result.transaction('meta', 'readwrite'); tx.objectStore('meta').delete('_rev'); tx.oncomplete = () => { r.result.close(); res(); }; };
+    });
+  }));
+  // reload without the app rewriting the mirror on the way out
+  await page.evaluate(() => { Storage.prototype.setItem = function () {}; });
+  await page.reload();
+  await page.waitForSelector('.bigbtn');
+  const names = (await typeNames()).join('|');
+  for (const n of ['Triceps & biceps', 'Back', 'Legs', 'Shoulders', 'Chest']) assert.ok(names.includes(n), n + ' missing: ' + names);
+  assert.equal((await page.locator('.row').count()), 2, 'workout history kept');
 });
 
 await ok('works offline after first load', async () => {

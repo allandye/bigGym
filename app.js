@@ -4,6 +4,7 @@
   const L = window.Logic;
   const S = window.Store;
   const app = document.getElementById('app');
+  const APP_VERSION = '3'; // matches VERSION in sw.js
 
   let ui = { screen: 'home', params: {} };
   let busy = false;          // guards against double taps on actions that create records
@@ -426,7 +427,8 @@
       '<p class="hint">One soft chime when rest reaches zero, while the app is open. The iPhone silent switch can mute it.</p>' +
       '<div class="label">Pocket guard</div>' +
       '<button class="outline" data-act="toggleGuard">Pocket guard: ' + (st.guard ? 'On' : 'Off') + '</button>' +
-      '<p class="hint">During a workout, a clear cover stops stray taps. It comes down when a set starts and after 10 seconds without a touch. Swipe up to lift it. Pull down the lock tab at the top right to bring it back.</p>';
+      '<p class="hint">During a workout, a clear cover stops stray taps. It comes down when a set starts and after 10 seconds without a touch. Swipe up to lift it. Pull down the lock tab at the top right to bring it back.</p>' +
+      '<p class="hint center">App version ' + APP_VERSION + '</p>';
   };
 
   // ---------- actions ----------
@@ -990,7 +992,19 @@
     if (a && !a.sets.length && !inside) await S.del('sessions', a.id);
     render();
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
+      const updating = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.register('sw.js').then(reg => {
+        // Home Screen apps are usually resumed, not relaunched, so check for an update on resume.
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+      }).catch(() => {});
+      // A new version took over: reload into it, but not while a number is being typed.
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!updating) return;
+        const reload = () => location.reload();
+        const el = document.activeElement;
+        if (el && el.tagName === 'INPUT') el.addEventListener('blur', () => S.flush().then(reload), { once: true });
+        else S.flush().then(reload);
+      });
     }
   }
 

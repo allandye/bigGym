@@ -60,7 +60,7 @@ For each exercise, the app looks at the last workout (of any type) that has conf
 
 ## Updating
 
-When the files change, the next launch downloads them in the background and the launch after that uses them. Your data isn't affected.
+When the files change, the app checks for the new version each time it opens or comes back to the screen. Once it has downloaded the new version it reloads itself a few seconds later, and your data isn't affected. *Backup & settings* shows the app version at the bottom.
 
 ## Files
 
